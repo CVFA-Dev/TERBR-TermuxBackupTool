@@ -97,9 +97,50 @@ function backup () {
   echo -e "${Y} [*] Backing Up Files.............."
   echo -e "${R} [!] It may take a while. Please wait...$N\n"
 
-  ${TERBR_COMMAND} "${TERBR_BACKUP_FILE}" ${TERBR_DIRS} | nl || error_exit
-
-  echo -e "${G} [!] Backup Done! "
+  if [ -n "${TERBR_ENCRYPT}" ]; then
+    echo -e "${Y} [*] Encrypting backup with password...$N\n"
+    # Check if openssl is installed
+    if ! type -p openssl &> /dev/null; then
+      echo -e "${R} [!] Error: openssl is not installed. Please install it first.$N"
+      echo -e "${Y} [*] Run: pkg install openssl-tool$N"
+      exit 1
+    fi
+    
+    # Ask for password if not provided
+    if [ -z "${TERBR_PASSWORD}" ]; then
+      echo -e "${Y} [*] Please enter a password for encryption:$N"
+      read -s TERBR_PASSWORD
+      echo
+      
+      # Confirm password
+      echo -e "${Y} [*] Please confirm the password:$N"
+      read -s TERBR_PASSWORD_CONFIRM
+      echo
+      
+      # Check if passwords match
+      if [ "${TERBR_PASSWORD}" != "${TERBR_PASSWORD_CONFIRM}" ]; then
+        echo -e "${R} [!] Error: Passwords do not match.$N"
+        exit 1
+      fi
+    fi
+    
+    # Create a temporary file for the tar output
+    TEMP_FILE=$(mktemp)
+    
+    # Create tar archive first
+    ${TERBR_COMMAND} "${TEMP_FILE}" ${TERBR_DIRS} | nl || error_exit
+    
+    # Encrypt the tar archive with openssl
+    openssl enc -aes-256-cbc -salt -in "${TEMP_FILE}" -out "${TERBR_BACKUP_FILE}" -k "${TERBR_PASSWORD}" || error_exit
+    
+    # Remove the temporary file
+    rm -f "${TEMP_FILE}"
+    
+    echo -e "${G} [!] Backup encrypted and saved to '${TERBR_BACKUP_FILE}'"
+  else
+    ${TERBR_COMMAND} "${TERBR_BACKUP_FILE}" ${TERBR_DIRS} | nl || error_exit
+    echo -e "${G} [!] Backup Done! "
+  fi
 }
 
 function restore () {
@@ -109,16 +150,54 @@ function restore () {
   echo -e "${Y} [*] Restoring Files..............."
   echo -e "${R} [!] It may take a while. Please wait...\n"
 
-  ${TERBR_COMMAND} "${TERBR_RESTORE_FILE}" ${TERBR_DIRS} | nl || error_exit
+  # Check if the file is encrypted by examining its contents
+  if file "${TERBR_RESTORE_FILE}" | grep -q "openssl.*data" || head -c 8 "${TERBR_RESTORE_FILE}" | grep -q "Salted__"; then
+    echo -e "${Y} [*] Encrypted backup detected.$N"
+    
+    # Check if openssl is installed
+    if ! type -p openssl &> /dev/null; then
+      echo -e "${R} [!] Error: openssl is not installed. Please install it first.$N"
+      echo -e "${Y} [*] Run: pkg install openssl-tool$N"
+      exit 1
+    fi
+    
+    # Ask for password if not provided
+    if [ -z "${TERBR_PASSWORD}" ]; then
+      echo -e "${Y} [*] Please enter the password for the encrypted backup:$N"
+      read -s TERBR_PASSWORD
+      echo
+    fi
+    
+    # Create a temporary file for the decrypted content
+    TEMP_FILE=$(mktemp)
+    
+    # Decrypt the backup
+    echo -e "${Y} [*] Decrypting backup...$N"
+    openssl enc -aes-256-cbc -d -salt -in "${TERBR_RESTORE_FILE}" -out "${TEMP_FILE}" -k "${TERBR_PASSWORD}" || {
+      echo -e "${R} [!] Error: Failed to decrypt backup. Incorrect password?$N"
+      rm -f "${TEMP_FILE}"
+      exit 1
+    }
+    
+    # Restore from the decrypted file
+    ${TERBR_COMMAND} "${TEMP_FILE}" ${TERBR_DIRS} | nl || error_exit
+    
+    # Remove the temporary file
+    rm -f "${TEMP_FILE}"
+  else
+    # Regular unencrypted backup
+    ${TERBR_COMMAND} "${TERBR_RESTORE_FILE}" ${TERBR_DIRS} | nl || error_exit
+  fi
 
   echo -e "${G} [!] Restore Done! "
 }
 
 function usage () {
-  echo -e "Usage: $(basename $0) -[hvVbr] "
+  echo -e "Usage: $(basename $0) -[hvVbre] "
   echo -e "Create Termux Backup and Restore it.\n"
   echo -e "    -b           Take backup"
   echo -e "    -r [FILE]    Restore backup"
+  echo -e "    -e [PASS]    Encrypt backup with password (use with -b) or decrypt backup (use with -r)"
   echo -e "    -p           List Installed Packages"
   echo -e "    -v           Verbose output"
   echo -e "    -h           Print usage"
@@ -145,21 +224,41 @@ function print_error () {
 function error_exit () {
   SIGNAL=$?
   rm -f "${TERBR_BACKUP_FILE}"
+  # Clean up any temporary files
+  if [ -n "${TEMP_FILE}" ] && [ -f "${TEMP_FILE}" ]; then
+    rm -f "${TEMP_FILE}"
+  fi
   exit ${SIGNAL}
 }
 
 # Trap signals
 trap 'error_exit' 1 2 3 15 20
 
-while getopts ':hvVpbr:' arg; do
+while getopts ':hvVpbr:e::' arg; do
   case $arg in
     b) unset TERBR_RESTORE; TERBR_BACKUP=1;;
     r) unset TERBR_BACKUP; TERBR_RESTORE=1; TERBR_RESTORE_FILE="${OPTARG}";;
+    e) 
+      TERBR_ENCRYPT=1
+      # If password is provided as argument, use it
+      if [ -n "${OPTARG}" ]; then
+        TERBR_PASSWORD="${OPTARG}"
+      fi
+      ;;
     p) TERBR_PKG_LIST=1;;
     v) TERBR_VERBOSE=1;;
     h) usage; exit;;
     V) version; exit;;
-    :) print_error "'${OPTARG}' option requires an argument."; usage >&2; exit 1;;
+    :) 
+      # Special case for -e without argument (not an error)
+      if [ "${OPTARG}" = "e" ]; then
+        TERBR_ENCRYPT=1
+      else
+        print_error "'${OPTARG}' option requires an argument."
+        usage >&2
+        exit 1
+      fi
+      ;;
     ?) print_error "unknown option '${OPTARG}'."; usage >&2; exit 1;;
   esac
 done
